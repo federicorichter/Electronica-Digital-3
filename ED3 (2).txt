@@ -1,0 +1,427 @@
+#include "LPC17xx.h"
+#include "lpc17xx_adc.h"
+#include "lpc17xx_uart.h"
+#include "lpc17xx_exti.h"
+#include "LPC17xx.h"
+#include "lpc17xx_pinsel.h"
+#include "lpc17xx_gpio.h"
+#include "lpc17xx_dac.h"
+#include "lpc17xx_adc.h"
+#include "lpc17xx_gpdma.h"
+#include "lpc17xx_timer.h"
+#include "lpc17xx_clkpwr.h"
+#include <stdio.h>
+#include <math.h>
+#define bufSize 2048
+
+uint8_t buf0[bufSize];
+uint8_t buf1[bufSize];
+uint32_t samples;
+uint8_t uartEnd = 0;
+uint8_t counterTimer = 0;
+uint8_t crossZero = 0;
+uint8_t saveADC = 0;
+uint8_t stat = 0;
+uint16_t promf = 2048;		// Se inicia en una media general
+uint16_t prom = 2048;		// Se inicia en una media general
+uint16_t minVal = 4096;		// Se inicia en valor máximo para obtener mínimo
+uint16_t maxVal = 0;		// Se inicia en valor mínimo para obtener máximo
+uint32_t frec = 0;			// Se inicia en 0
+uint32_t frecArray[20];
+uint8_t frecArrayIndex = 0;
+uint8_t digFrec[5] = {0,0,0,0,0}; // Inicio un arreglo que contendrá los dígitos de frec
+uint8_t display = 0;		// Se inicia prendiendo el primer display
+uint8_t dispFrec[3] = {0,0,0}; // Se inicia un arreglo con los valores del display
+uint8_t valuesDisp[20] = {
+	    0x3F, // 0
+	    0x06, // 1
+	    0x5B, // 2
+	    0x4F, // 3
+	    0x66, // 4
+	    0x6D, // 5
+	    0x7D, // 6
+	    0x07, // 7
+	    0x7F, // 8
+	    0x6F, // 9
+		0xBF, // 0. (0b10111111)
+		0x86, // 1. (0b10000110)
+		0xDB, // 2. (0b11011011)
+		0xCF, // 3. (0b11001111)
+		0xE6, // 4. (0b11100110)
+		0xED, // 5. (0b11101101)
+		0xFD, // 6. (0b11111101)
+		0x87, // 7. (0b10000111)
+		0xFF, // 8. (0b11111111)
+		0xEF  // 9. (0b11101111)
+	};
+uint16_t count = 0;
+uint16_t k = 0;
+uint8_t buffer = 1;
+GPDMA_LLI_Type lli0;
+GPDMA_LLI_Type lli1;
+uint32_t testingCuadrada = 1000;
+
+void configADC(){
+
+	PINSEL_CFG_Type pinsel_cfg;
+	pinsel_cfg.Portnum = 0;
+	pinsel_cfg.Pinnum = 23;
+	pinsel_cfg.Funcnum = 1;
+	pinsel_cfg.Pinmode = 0;
+	pinsel_cfg.OpenDrain = 0;
+	PINSEL_ConfigPin(&pinsel_cfg);
+
+	ADC_Init(LPC_ADC,200000);
+	ADC_BurstCmd(LPC_ADC,DISABLE);
+	ADC_IntConfig(LPC_ADC,ADC_ADGINTEN,ENABLE);
+}
+
+void configUART(void){
+
+	PINSEL_CFG_Type PinCfg;
+	PinCfg.Funcnum = 1;  // Función 1 para UART
+	PinCfg.Portnum = 0;  // Puerto 0
+	PinCfg.Pinnum = 10;   // P0.10 para TXD2
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 11;   // P0.11 para RXD2
+	PINSEL_ConfigPin(&PinCfg);
+
+    // Configura el periférico UART
+	UART_CFG_Type UARTConfigStruct;
+	UART_FIFO_CFG_Type FIFOCfg;
+
+	FIFOCfg.FIFO_DMAMode = ENABLE;
+	FIFOCfg.FIFO_Level = UART_FIFO_TRGLEV1; //Poner en 0
+	FIFOCfg.FIFO_ResetRxBuf = ENABLE; 
+	FIFOCfg.FIFO_ResetTxBuf = ENABLE;
+	UARTConfigStruct.Baud_rate = 460800;
+    UARTConfigStruct.Databits = UART_DATABIT_8;  // 8 bits de datos
+    UARTConfigStruct.Parity = UART_PARITY_NONE;  // Paridad par
+    UARTConfigStruct.Stopbits = UART_STOPBIT_1;  // 1 bit de parada
+	UART_FIFOConfigStructInit(&FIFOCfg);
+	UART_Init(LPC_UART2, &UARTConfigStruct);
+	UART_FIFOConfig(LPC_UART2, &FIFOCfg);
+}
+
+
+void configDMA() {
+
+	NVIC_DisableIRQ(DMA_IRQn);
+
+
+    // Configura el primer LLI para transmitir array1
+    lli0.SrcAddr = (uint32_t)buf0;
+    lli0.DstAddr = (uint32_t)&LPC_UART2->THR;
+    lli0.NextLLI = (uint32_t)&lli1; // Apunta al segundo LLI
+    lli0.Control = (((bufSize) & ~(0x3F<<18)) & ~(1<<27)) | (1 << 26) | (1<<31);
+
+
+
+    // Configura el segundo LLI para transmitir array2
+    lli1.SrcAddr = (uint32_t)buf1;
+    lli1.DstAddr = (uint32_t)&(LPC_UART2->THR);
+    lli1.NextLLI = (uint32_t)&lli0; // Apunta al primer LLI para un bucle infinito
+    lli1.Control = (((bufSize) & ~(0x3F<<18)) & ~(1<<27)) | (1 << 26) | (1<<31);
+
+    GPDMA_Init();
+    // Configura el canal DMA
+    GPDMA_Channel_CFG_Type GPDMACfg;
+    GPDMACfg.ChannelNum = 0;
+    GPDMACfg.SrcMemAddr = (uint32_t)buf0; // Buffer que contiene ambos arrays
+    GPDMACfg.DstMemAddr = 0; // Transmisión UART
+    GPDMACfg.TransferSize = (bufSize); // Tamaño del buffer
+    GPDMACfg.TransferWidth = 0; // Ancho de transferencia de 8 bits
+    GPDMACfg.TransferType = GPDMA_TRANSFERTYPE_M2P; // De memoria a periférico (UART)
+    GPDMACfg.SrcConn = 0; // Conexión de fuente (0 para memoria)
+    GPDMACfg.DstConn = GPDMA_CONN_UART2_Tx; // Conexión de destino para UART2
+    GPDMACfg.DMALLI = (uint32_t) &lli1; // El primer LLI
+    GPDMA_Setup(&GPDMACfg);
+
+    GPDMA_ClearIntPending(GPDMA_STATCLR_INTTC,0);
+    GPDMA_ClearIntPending(GPDMA_STATCLR_INTERR,0);
+    LPC_GPDMACH0->DMACCControl = (((bufSize) & ~(0x3F<<18)) & ~(1<<27)) | (1 << 26) | (1<<31);
+    //LPC_GPDMACH0->DMACCConfig &= ~(1<<14);
+}
+
+void configTimer0(){
+	TIM_TIMERCFG_Type timcfg;
+	timcfg.PrescaleOption = TIM_PRESCALE_TICKVAL;
+	timcfg.PrescaleValue = 1;
+	TIM_Init(LPC_TIM0,TIM_TIMER_MODE,&timcfg);
+}
+
+void configTimer1(){
+
+
+	TIM_TIMERCFG_Type timcfg;
+	timcfg.PrescaleOption = TIM_PRESCALE_TICKVAL;
+	timcfg.PrescaleValue = 25;
+	TIM_MATCHCFG_Type matcfg;
+	matcfg.MatchValue = (25000000/(testingCuadrada*2))/(25);
+	matcfg.IntOnMatch = DISABLE;
+	matcfg.MatchChannel = 1;
+	matcfg.ResetOnMatch = ENABLE;
+	matcfg.StopOnMatch = DISABLE;
+	matcfg.ExtMatchOutputType = TIM_EXTMATCH_TOGGLE;
+
+	TIM_Init(LPC_TIM1,TIM_TIMER_MODE,&timcfg);
+	TIM_ConfigMatch(LPC_TIM1,&matcfg);
+}
+
+void configTimer2(){
+	TIM_TIMERCFG_Type timcfg;
+	timcfg.PrescaleOption = TIM_PRESCALE_TICKVAL;
+	timcfg.PrescaleValue = 25000;
+	TIM_MATCHCFG_Type matcfg;
+	matcfg.MatchValue = 4;
+	matcfg.IntOnMatch = ENABLE;
+	matcfg.MatchChannel = 0;
+	matcfg.ResetOnMatch = ENABLE;
+	matcfg.StopOnMatch = DISABLE;
+	matcfg.ExtMatchOutputType = TIM_EXTMATCH_NOTHING;
+	TIM_Init(LPC_TIM2,TIM_TIMER_MODE,&timcfg);
+	TIM_ConfigMatch(LPC_TIM2,&matcfg);
+
+}
+
+void configTimer3(void){
+	TIM_TIMERCFG_Type timcfg;
+	timcfg.PrescaleOption = TIM_PRESCALE_TICKVAL;
+	timcfg.PrescaleValue = 25000;
+	TIM_MATCHCFG_Type matcfg;
+	matcfg.MatchValue = 4999;
+	matcfg.IntOnMatch = ENABLE;
+	matcfg.MatchChannel = 0;
+	matcfg.ResetOnMatch = ENABLE;
+	matcfg.StopOnMatch = DISABLE;
+	matcfg.ExtMatchOutputType = TIM_EXTMATCH_NOTHING;
+	TIM_Init(LPC_TIM3,TIM_TIMER_MODE,&timcfg);
+	TIM_ConfigMatch(LPC_TIM3,&matcfg);
+}
+
+void divFrec(void){ // Descompone el valor de frec en sus dígitos individuales
+	uint32_t buf = frec;		// Variable de buffer para no modificar frec
+	for(uint8_t i = 5; i>0; i--){
+		if(i == 3){				// Caso del punto, se encuentra entre k y centena
+			digFrec[i-1] = 10 + buf/(uint32_t)pow(10,i);// Posición del punto en valuesDisp
+			buf = buf%(uint32_t)pow(10,i);				// Muevo la centena a la decena, posición luego del punto
+		}else{
+			digFrec[i-1] = buf/(uint32_t)pow(10,i);		// Cargo el dígito: posición = exp de 10
+			buf = buf%(uint32_t)pow(10,i);				// Elimino el dato cargado
+		}
+	}
+}
+
+void prepArray(void){
+	uint8_t a = 2;										// Variable de límite de dato
+	uint8_t trun = 1;									// Variable de estado de escritura
+	for(uint8_t i = 5; i>a; i--){						// Carga el array de display
+		if((digFrec[i-1] == 0) && (trun) && (i>3)){
+			a--;										// Mueve el límite de dato
+		}else{
+			dispFrec[i-1-a] = digFrec[i-1];					// El array es cargado
+			trun = 0;									// Modifica la variable de estado
+		}
+	}
+}
+
+void configEint(){
+	PINSEL_CFG_Type pinCfg;
+	pinCfg.Funcnum = PINSEL_FUNC_1;
+	pinCfg.Portnum = PINSEL_PORT_2;
+	pinCfg.Pinnum = PINSEL_PIN_10;
+	pinCfg.Pinmode = PINSEL_PINMODE_PULLDOWN;
+	PINSEL_ConfigPin(&pinCfg);
+	EXTI_Init();
+	EXTI_InitTypeDef extiCfg;
+	extiCfg.EXTI_Line = EXTI_EINT0;
+	extiCfg.EXTI_Mode = EXTI_MODE_EDGE_SENSITIVE;
+	extiCfg.EXTI_polarity = EXTI_POLARITY_HIGH_ACTIVE_OR_RISING_EDGE;
+	EXTI_Config(&extiCfg);
+
+}
+
+void calcFrec(uint16_t ADCvalue){ // Se ejecuta cada vez que el ADC presenta un nuevo valor.
+
+	// Verificamos si la señal está en el semiciclo negativo
+	if(ADCvalue<promf){
+		stat = 1;	// Seteamos la variable de estado de semiciclo negativo
+	}
+	// Verificamos si la señal está en el semiciclo positivo y si vino de uno negativo
+	if((ADCvalue>promf) && (stat==1)){
+		crossZero = 1;
+		frecArray[frecArrayIndex]=25000000/(LPC_TIM0->TC);
+		frecArrayIndex++;
+		frecArrayIndex = frecArrayIndex%20;
+		// Se descompone el valor de frec en sus dígitos individuales
+		TIM_ResetCounter(LPC_TIM0);		// Reiniciamos el contador
+		stat = 0;					// Limpiamos la variable de estado de semiciclo negativo
+	}
+	// Encontramos el valor máximo de la señal
+	if(ADCvalue>maxVal){
+		maxVal = ADCvalue;
+	}
+	// Encontramos el valor mínimo de la señal
+	if(ADCvalue<minVal){
+		minVal = ADCvalue;
+	}
+	prom = (minVal + maxVal)/2;		// Encontramos el valor promedio de la señal (offset)
+}
+
+void configGPIO(void){
+	// Usar CMSIS
+	LPC_PINCON->PINSEL0 &= ~(0xFFFF);
+	LPC_PINCON->PINMODE0 &= ~(0xFFFF);
+
+	LPC_PINCON->PINSEL4 &= ~(0x3F);
+	LPC_PINCON->PINMODE4 &= ~(0x3F);
+
+	LPC_GPIO0->FIODIR |= 0xFF;
+	LPC_GPIO0->FIOMASK |= ~(0xFF);
+	LPC_GPIO0->FIOCLR |= 0xFF;
+
+	LPC_GPIO2->FIODIR |= 0x7;
+	LPC_GPIO2->FIOCLR |= 0x7;
+
+	LPC_PINCON->PINSEL3 |= (0x3 << 18);
+
+}
+
+int main(void) {
+	for(int i =0;i<bufSize;i++){
+		buf0[i] =68;
+		buf1[i]=69;
+	}
+	NVIC_SetPriority(TIMER2_IRQn,2);
+	NVIC_SetPriority(DMA_IRQn,0);
+	NVIC_SetPriority(ADC_IRQn,1);
+	NVIC_SetPriority(TIMER1_IRQn,4);
+	NVIC_SetPriority(TIMER3_IRQn,3);
+	NVIC_SetPriority(EINT0_IRQn,5);
+	configTimer0();
+	configTimer1();
+	configTimer2();
+	configTimer3();
+	configGPIO();
+	configEint();
+	configUART();
+	configDMA();
+	configADC();
+
+	TIM_Cmd(LPC_TIM0,ENABLE);
+	TIM_Cmd(LPC_TIM1,ENABLE);
+	TIM_Cmd(LPC_TIM2,ENABLE);
+	TIM_Cmd(LPC_TIM3,ENABLE);
+	UART_TxCmd(LPC_UART2, ENABLE);
+	GPDMA_ChannelCmd(0, ENABLE);
+	ADC_ChannelCmd(LPC_ADC,0,ENABLE);
+	NVIC_EnableIRQ(TIMER1_IRQn);
+	NVIC_EnableIRQ(TIMER2_IRQn);
+	GPDMA_ClearIntPending(GPDMA_STATCLR_INTTC,0);
+	GPDMA_ClearIntPending(GPDMA_STATCLR_INTERR,0);
+	NVIC_ClearPendingIRQ(DMA_IRQn);
+	NVIC_EnableIRQ(ADC_IRQn);
+	ADC_StartCmd(LPC_ADC,ADC_START_NOW);
+	NVIC_EnableIRQ(DMA_IRQn);
+	EXTI_ClearEXTIFlag(EXTI_EINT0);
+	NVIC_EnableIRQ(EINT0_IRQn);
+	
+	while(1){
+		if(uartEnd){
+			uartEnd = 0;
+			crossZero = 0;
+			while(1){
+				if(crossZero){
+					saveADC = 1;
+					break;
+				}
+			}
+		}
+	}
+
+}
+
+void ADC_IRQHandler(void){
+	uint16_t valor = ((ADC_GlobalGetData(LPC_ADC)>>4)&0xFFF);
+	uint8_t valAux = valor >> 4;
+	ADC_StartCmd(LPC_ADC,ADC_START_NOW);
+	calcFrec(valor);
+	if(saveADC){
+		if(buffer){
+			buf1[count] = valAux;
+		}else{
+			buf0[count] = valAux;
+		}
+		count++;
+	}
+	if(count == bufSize){
+		count = 0;
+		saveADC = 0;
+	}
+}
+
+void DMA_IRQHandler(void){
+
+	//GPDMA_ChannelCmd(0, DISABLE);
+	if(!k){
+		for(int i = 0; i<500000;i++);
+		k = 1;
+	}
+	uartEnd = 1;
+	buffer = (buffer+1)%2;
+	count = 0;
+	saveADC = 0;
+	GPDMA_ClearIntPending(GPDMA_STATCLR_INTTC,0);
+	GPDMA_ClearIntPending(GPDMA_STATCLR_INTERR,0);
+	NVIC_ClearPendingIRQ(DMA_IRQn);
+	}
+}
+
+void EINT0_IRQHandler(){
+	//Tiene rebote jeje
+	if((testingCuadrada*2) > 50000){
+		testingCuadrada = 1000;
+	}
+	else{
+		testingCuadrada *= 2;
+	}
+	TIM_Cmd(LPC_TIM1,DISABLE);
+	TIM_ResetCounter(LPC_TIM1);
+	TIM_UpdateMatchValue(LPC_TIM1,1,(25000000/(testingCuadrada*2))/(25));
+	EXTI_ClearEXTIFlag(EXTI_EINT0);
+	TIM_Cmd(LPC_TIM1,ENABLE);
+}
+
+void calcProm(){
+	uint32_t aux = 0;
+	for(int i = 0; i<20;i++){
+		aux += frecArray[i];
+	}
+	frec = aux/20;
+}
+
+void TIMER2_IRQHandler(void){ // Interrumpimos por MATCH0 cada 5 ms
+	prepArray();
+	// Puerto 0 con FIOMASK que solo permita modificar los primeros 8 bits
+	// display0 es el menos significativo
+	if(counterTimer == 200){
+		calcProm();
+		divFrec();// Se descompone el valor de frec en sus dígitos individuales
+		counterTimer = 0;
+	}
+	counterTimer++;
+	LPC_GPIO2->FIOCLR |= (1<<((display+2)%3));			// Apaga el display que está prendido
+	LPC_GPIO0->FIOPIN = valuesDisp[dispFrec[display]];	// Escribe el número por el puerto
+	LPC_GPIO2->FIOSET |= (1<<(display%3));				// Prende el próximo  display
+	display++;											// Cambia el display para la próximo
+	display = display%3;								// Reinicia los valores a máximo dos
+	LPC_TIM2->IR |= 1;
+}
+
+void TIMER3_IRQHandler(void){
+	promf = prom;				// Bufereamos la variable prom
+	minVal = 4096;				// Recargamos lo valores para reencontrar el mínimo
+	maxVal = 0;					// Recargamos lo valores para reencontrar el máximo
+	LPC_TIM3->IR |= 1;			// Limpiamos las flags
+}
+
